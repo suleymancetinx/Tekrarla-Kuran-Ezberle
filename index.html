@@ -62,6 +62,9 @@ tailwind.config = {
   .ctrl-btn:disabled { opacity: 0.25; cursor: not-allowed; }
   .progress-fill { transition: width 0.35s ease; }
   @media (max-width: 640px) { .pb-safe { padding-bottom: max(1rem, env(safe-area-inset-bottom)); } }
+  .active-mode { background: rgba(78,222,163,0.1) !important; border-color: rgba(78,222,163,0.4) !important; color: #4edea3 !important; }
+  @keyframes spin-slow { to { transform: rotate(360deg); } }
+  .loading-spin { animation: spin-slow 1s linear infinite; }
 </style>
 </head>
 <body class="dark text-on-surface selection:bg-primary/20">
@@ -101,6 +104,21 @@ tailwind.config = {
         <span id="repsValue" class="text-primary font-bold text-lg">3</span>
       </div>
       <input id="reps" type="range" min="2" max="10" value="3" class="w-full accent-primary">
+    </div>
+    <!-- Mod -->
+    <div class="flex flex-col gap-2">
+      <label class="text-[11px] font-semibold uppercase tracking-widest text-on-surface-dim">Ezber Yöntemi</label>
+      <div class="grid grid-cols-2 gap-2" id="modeGroup">
+        <button data-mode="forward" class="mode-btn active-mode glass rounded-xl px-3 py-2.5 text-xs font-semibold text-primary border border-primary/30 flex flex-col items-center gap-1 transition-all">
+          <span class="material-symbols-outlined text-[18px]">trending_up</span>
+          İlerleyen
+        </button>
+        <button data-mode="reverse" class="mode-btn glass rounded-xl px-3 py-2.5 text-xs font-semibold text-on-surface-dim border border-white/10 flex flex-col items-center gap-1 transition-all hover:border-primary/30 hover:text-primary">
+          <span class="material-symbols-outlined text-[18px]">trending_down</span>
+          Tersine
+        </button>
+      </div>
+      <p id="modeDesc" class="text-[10px] text-on-surface-dim leading-relaxed">1. ayet x kez → 2. ayet x kez → … → tüm ayetler x kez</p>
     </div>
     <!-- Kari -->
     <div class="glass rounded-xl px-4 py-3 flex items-center gap-3">
@@ -356,6 +374,13 @@ function loadSettings() {
   repsVal.textContent = repsEl.value;
   refreshSuraMax();
   loadLastPos();
+  // Restore mode
+  const savedMode = LS.load('mode', 'forward');
+  currentMode = savedMode;
+  document.querySelectorAll('.mode-btn').forEach(b => {
+    b.classList.toggle('active-mode', b.dataset.mode === currentMode);
+  });
+  document.getElementById('modeDesc').textContent = modeDescs[currentMode];
 }
 
 function loadLastPos() {
@@ -384,6 +409,51 @@ document.getElementById('btnResume').onclick = () => {
   qPos = resumePos;
   runFrom(resumePos);
 };
+
+// ── Mode selector ──
+let currentMode = 'forward';
+const modeDescs = {
+  forward: '1. ayet x kez → 2. ayet x kez → … → tüm ayetler x kez',
+  reverse: 'Son ayet x kez → son+önceki x kez → … → tüm ayetler x kez'
+};
+document.getElementById('modeGroup').addEventListener('click', e => {
+  const btn = e.target.closest('.mode-btn');
+  if (!btn) return;
+  currentMode = btn.dataset.mode;
+  document.querySelectorAll('.mode-btn').forEach(b => {
+    b.classList.toggle('active-mode', b.dataset.mode === currentMode);
+    if (b.dataset.mode !== currentMode) { b.classList.remove('text-primary'); }
+  });
+  document.getElementById('modeDesc').textContent = modeDescs[currentMode];
+  LS.save('mode', currentMode);
+});
+
+// ── Audio Cache ──
+const audioCache = new Map(); // url -> AudioBuffer via Web Audio, or just Audio objects
+
+async function preloadAudio(url) {
+  if (audioCache.has(url)) return audioCache.get(url);
+  return new Promise((resolve) => {
+    const a = new Audio();
+    a.preload = 'auto';
+    a.oncanplaythrough = () => { audioCache.set(url, a); resolve(a); };
+    a.onerror = () => { audioCache.set(url, null); resolve(null); };
+    // If it loads but event doesn't fire quickly, resolve after a timeout too
+    setTimeout(() => { if (!audioCache.has(url)) { audioCache.set(url, a); resolve(a); } }, 8000);
+    a.src = url;
+    a.load();
+  });
+}
+
+function preloadNext(indices) {
+  // Preload upcoming audio files in background (no await)
+  indices.forEach(i => {
+    if (i >= 0 && i < queue.length) {
+      const url = `${BASE}${queue[i].sura}_${queue[i].ayah}.mp3`;
+      if (!audioCache.has(url)) preloadAudio(url);
+    }
+  });
+}
 
 // ── State ──
 let queue = [], qPos = 0, isPlaying = false, isPaused = false, stopFlag = false, audio = null, resolvePlay = null;
@@ -432,14 +502,39 @@ function buildQueue() {
   end = Math.max(start, Math.min(end, maxV));
   document.getElementById('startAyah').value = start;
   document.getElementById('endAyah').value = end;
+  const suraName = getSuraName(sura);
   queue = [];
-  for (let pivot = start; pivot <= end; pivot++) {
-    for (let r = 0; r < reps; r++) {
-      for (let a = start; a <= pivot; a++) {
-        queue.push({ sura, ayah: a, rep: r + 1, totalReps: reps, pivot, suraName: getSuraName(sura) });
+
+  if (currentMode === 'forward') {
+    // Her ayet kendi başına x kez, sonra birikimli son grup
+    // 1. Ayet 1 x kez, 2. Ayet 2 x kez ... son grup (1..n) x kez
+    for (let pivot = start; pivot <= end; pivot++) {
+      for (let r = 0; r < reps; r++) {
+        if (pivot === end) {
+          // Son adım: start'tan end'e kadar hepsini sırayla
+          for (let a = start; a <= end; a++) {
+            queue.push({ sura, ayah: a, rep: r + 1, totalReps: reps, pivot, suraName, groupLabel: `${start}–${end}. Ayet` });
+          }
+        } else {
+          // Tek ayet tekrarı
+          queue.push({ sura, ayah: pivot, rep: r + 1, totalReps: reps, pivot, suraName, groupLabel: `${pivot}. Ayet` });
+        }
+      }
+    }
+  } else {
+    // Tersine: son ayetten başla, her adımda bir öncekini de ekle
+    // Örn: 1-3, x=3 → 3 x3, 2-3 x3, 1-3 x3
+    for (let pivot = end; pivot >= start; pivot--) {
+      for (let r = 0; r < reps; r++) {
+        for (let a = pivot; a <= end; a++) {
+          queue.push({ sura, ayah: a, rep: r + 1, totalReps: reps, pivot, suraName, groupLabel: pivot === end ? `${end}. Ayet` : `${pivot}–${end}. Ayet` });
+        }
       }
     }
   }
+
+  // Clear cache when new queue is built (different sura/range might be selected)
+  audioCache.clear();
   return queue;
 }
 
@@ -463,7 +558,7 @@ function getGroups() {
   const groups = []; let cur = null;
   queue.forEach((item, i) => {
     const key = `${item.pivot}-${item.rep}`;
-    if (!cur || cur.key !== key) { cur = { key, pivot: item.pivot, rep: item.rep, totalReps: item.totalReps, startIdx: i, endIdx: i, sura: item.sura, suraName: item.suraName }; groups.push(cur); }
+    if (!cur || cur.key !== key) { cur = { key, pivot: item.pivot, rep: item.rep, totalReps: item.totalReps, startIdx: i, endIdx: i, sura: item.sura, suraName: item.suraName, groupLabel: item.groupLabel }; groups.push(cur); }
     else { cur.endIdx = i; }
   });
   return groups;
@@ -478,13 +573,11 @@ function renderLog() {
   const groups = getGroups();
   logCount.textContent = `${groups.length} grup · ${queue.length} ses`;
   logBody.innerHTML = groups.map((g, gi) => {
-    const s = queue[g.startIdx].ayah;
-    const e = queue[g.endIdx].ayah;
-    const range = s === e ? `${s}. Ayet` : `${s}–${e}. Ayet`;
+    const label = g.groupLabel || `${queue[g.startIdx].ayah}. Ayet`;
     return `<div class="log-item flex items-center gap-3 px-5 py-3 border border-transparent" id="grp${gi}">
       <span class="w-5 text-right text-[11px] text-on-surface-dim font-mono flex-shrink-0">${gi+1}</span>
       <div class="w-1.5 h-1.5 rounded-full bg-white/15 flex-shrink-0" id="dot${gi}"></div>
-      <span class="flex-1 text-sm text-on-surface/70">${g.suraName} · ${range}</span>
+      <span class="flex-1 text-sm text-on-surface/70">${g.suraName} · ${label}</span>
       <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-white/5 text-on-surface-dim">${g.rep}/${g.totalReps}</span>
     </div>`;
   }).join('');
@@ -562,21 +655,32 @@ function showPlayIcon(playing) {
   playIcon.textContent = playing ? 'pause' : 'play_arrow';
 }
 
-function playFile(url) {
+async function playFile(url) {
+  // Stop previous
+  if (audio) { audio.pause(); audio.src = ''; audio = null; }
+
+  // Show loading state briefly if not cached
+  let cachedAudio = audioCache.get(url);
+  if (!cachedAudio) {
+    document.getElementById('statusText').textContent = 'Yükleniyor…';
+    document.getElementById('statusDot').style.cssText = 'background:#fbbf24;';
+    cachedAudio = await preloadAudio(url);
+  }
+
   return new Promise(resolve => {
-    if (audio) { audio.pause(); audio.src = ''; }
-    audio = new Audio(url);
+    // Clone by creating new Audio from same src (can't reuse same element for overlaps)
+    const a = new Audio(url);
+    audio = a;
     resolvePlay = resolve;
-    audio.onended = () => resolve('ended');
-    audio.onerror = () => resolve('error');
-    audio.onloadedmetadata = () => {
-      if (audio.duration && !isNaN(audio.duration)) {
-        const remaining = queue.length - qPos;
-        const totalEst = qPos * (audio.duration + 1.5) + remaining * audio.duration + Math.max(0, remaining - 1) * 1.5;
-        updateTotalDuration(audio.duration);
-      }
+    a.onended = () => resolve('ended');
+    a.onerror = () => resolve('error');
+    a.onloadedmetadata = () => {
+      if (a.duration && !isNaN(a.duration)) updateTotalDuration(a.duration);
     };
-    audio.play().catch(() => resolve('error'));
+    // Restore playing status label
+    document.getElementById('statusText').textContent = 'Çalıyor';
+    document.getElementById('statusDot').style.cssText = 'background:#4edea3; box-shadow: 0 0 8px #4edea3;';
+    a.play().catch(() => resolve('error'));
   });
 }
 
@@ -593,14 +697,24 @@ function delay(ms) {
 async function runFrom(startPos) {
   isPlaying = true; stopFlag = false;
   showPlayIcon(true);
+
+  // Preload first 3 items immediately
+  preloadNext([startPos, startPos+1, startPos+2]);
+
   for (let i = startPos; i < queue.length; i++) {
     if (stopFlag) break;
     qPos = i;
     updateNP(queue[i], i);
     updateLog(i);
+
+    // Preload next 3 in background while current plays
+    preloadNext([i+1, i+2, i+3]);
+
     while (isPaused) { await new Promise(r => setTimeout(r, 80)); if (stopFlag) break; }
     if (stopFlag) break;
-    const res = await playFile(`${BASE}${queue[i].sura}_${queue[i].ayah}.mp3`);
+
+    const url = `${BASE}${queue[i].sura}_${queue[i].ayah}.mp3`;
+    const res = await playFile(url);
     if (stopFlag || res === 'stop') break;
     if (i < queue.length - 1) { const d = await delay(1500); if (stopFlag || d === 'stop') break; }
   }
